@@ -21,10 +21,12 @@ use std::time::Duration;
 
 use catalog_service::config::{PORT_VARIABLE, PostgresConfig};
 use catalog_service::db;
-use catalog_service::domain::{Example, ExampleId};
-use catalog_service::store::{Examples, PgExamples, StoreError};
+use catalog_service::domain::{Catalog, CatalogDetails, CatalogId, NewCatalog, Page};
+use catalog_service::store::{Catalogs, PgCatalogs, StoreError};
 use serde_json::Value;
 use telemetry::logging::Logger;
+use time::OffsetDateTime;
+use time::macros::datetime;
 
 // Not every test file uses both.
 #[allow(unused_imports)]
@@ -68,7 +70,7 @@ impl DerefMut for Service {
 }
 
 /// The service's store over `postgres`, migrated as the service migrates it.
-pub async fn store(postgres: &Postgres) -> PgExamples {
+pub async fn store(postgres: &Postgres) -> PgCatalogs {
     let env: HashMap<_, _> = postgres.env().into_iter().collect();
     let config = PostgresConfig {
         host: env["POSTGRES_HOST"].clone(),
@@ -79,37 +81,54 @@ pub async fn store(postgres: &Postgres) -> PgExamples {
     };
     let pool = db::connect(&config).await.unwrap();
     db::migrate(&pool).await.unwrap();
-    PgExamples::new(pool)
+    PgCatalogs::new(pool)
 }
 
-/// An in-memory `example` table; `failing` makes every call fail as a
-/// database would, `down` makes the ping fail.
+/// An in-memory `catalog` table (Postgres's order: newest first, ties by
+/// id); `failing` makes every call fail as a database would, `down` makes the
+/// ping fail.
 #[derive(Clone, Default)]
 pub struct Memory {
-    rows: Arc<Mutex<Vec<Example>>>,
+    rows: Arc<Mutex<Vec<Catalog>>>,
+    clock: Arc<Mutex<i64>>,
     pub failing: Arc<AtomicBool>,
     pub down: Arc<AtomicBool>,
 }
 
 impl Memory {
-    /// Holding `rows`.
-    pub fn with(rows: Vec<Example>) -> Self {
-        Self {
-            rows: Arc::new(Mutex::new(rows)),
-            ..Self::default()
-        }
-    }
-
     fn fail(&self) -> Result<(), StoreError> {
         if self.failing.load(Ordering::SeqCst) {
             return Err(StoreError::Database(sqlx::Error::PoolClosed));
         }
         Ok(())
     }
+
+    /// A distinct "now" per write, a second apart.
+    fn now(&self) -> OffsetDateTime {
+        let mut tick = self.clock.lock().unwrap();
+        *tick += 1;
+        datetime!(2026-11-22 12:00:00 UTC) + time::Duration::seconds(*tick)
+    }
 }
 
-impl Examples for Memory {
-    async fn get(&self, id: ExampleId) -> Result<Option<Example>, StoreError> {
+impl Catalogs for Memory {
+    async fn create(&self, id: CatalogId, new: &NewCatalog) -> Result<Catalog, StoreError> {
+        self.fail()?;
+        let now = self.now();
+        let entry = Catalog {
+            id,
+            name: new.details.name.clone(),
+            description: new.details.description.clone(),
+            price_cents: new.details.price_cents,
+            sku: new.sku.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.rows.lock().unwrap().push(entry.clone());
+        Ok(entry)
+    }
+
+    async fn get(&self, id: CatalogId) -> Result<Option<Catalog>, StoreError> {
         self.fail()?;
         Ok(self
             .rows
@@ -120,10 +139,39 @@ impl Examples for Memory {
             .cloned())
     }
 
-    async fn insert(&self, example: &Example) -> Result<(), StoreError> {
+    async fn update(
+        &self,
+        id: CatalogId,
+        details: &CatalogDetails,
+    ) -> Result<Option<Catalog>, StoreError> {
         self.fail()?;
-        self.rows.lock().unwrap().push(example.clone());
-        Ok(())
+        let now = self.now();
+        let mut rows = self.rows.lock().unwrap();
+        Ok(rows.iter_mut().find(|row| row.id == id).map(|row| {
+            row.name.clone_from(&details.name);
+            row.description.clone_from(&details.description);
+            row.price_cents = details.price_cents;
+            row.updated_at = now;
+            row.clone()
+        }))
+    }
+
+    async fn delete(&self, id: CatalogId) -> Result<bool, StoreError> {
+        self.fail()?;
+        let mut rows = self.rows.lock().unwrap();
+        let before = rows.len();
+        rows.retain(|row| row.id != id);
+        Ok(rows.len() < before)
+    }
+
+    async fn list(&self, page: Page) -> Result<(Vec<Catalog>, i64), StoreError> {
+        self.fail()?;
+        let mut rows = self.rows.lock().unwrap().clone();
+        rows.sort_by_key(|row| std::cmp::Reverse((row.created_at, row.id.uuid())));
+        let total = i64::try_from(rows.len()).unwrap();
+        let skip = usize::try_from(page.offset).unwrap();
+        let take = usize::try_from(page.limit).unwrap();
+        Ok((rows.into_iter().skip(skip).take(take).collect(), total))
     }
 
     async fn ping(&self, _within: Duration) -> bool {

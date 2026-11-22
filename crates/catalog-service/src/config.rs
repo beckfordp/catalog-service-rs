@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
+use std::time::Duration;
 
 pub use service_basics::config::{ConfigError, PostgresConfig};
 use service_basics::config::{port, postgres};
@@ -25,8 +26,10 @@ pub struct Config {
     pub service_name: String,
     /// `POSTGRES_*`.
     pub postgres: PostgresConfig,
-    /// `REDIS_URI`: the read cache (never the source of truth).
+    /// `REDIS_URI`: the list cache (never the source of truth).
     pub redis_uri: String,
+    /// `CATALOG_LIST_CACHE_TTL_SECONDS`: how long a cached list page stands.
+    pub list_ttl: Duration,
     /// `OTEL_*`.
     pub tracing: TracingConfig,
 }
@@ -41,6 +44,19 @@ pub fn from_env<S: BuildHasher>(env: &HashMap<String, String, S>) -> Result<Conf
     let http_port = port(env, PORT_VARIABLE, 8080, &mut problems);
     let postgres = postgres(env, "catalog", &mut problems);
     let tracing = tracing_from_env(env, &mut problems);
+    let list_ttl = match env
+        .get("CATALOG_LIST_CACHE_TTL_SECONDS")
+        .map(|raw| raw.parse::<u64>())
+    {
+        None => 60,
+        Some(Ok(seconds)) if seconds > 0 => seconds,
+        Some(_) => {
+            problems.push(
+                "CATALOG_LIST_CACHE_TTL_SECONDS: not a positive whole number of seconds".to_owned(),
+            );
+            0
+        }
+    };
     if !problems.is_empty() {
         return Err(ConfigError { problems });
     }
@@ -49,6 +65,7 @@ pub fn from_env<S: BuildHasher>(env: &HashMap<String, String, S>) -> Result<Conf
         service_name: text("CATALOG_SERVICE_NAME", "catalog-service"),
         postgres,
         redis_uri: text("REDIS_URI", "redis://localhost:6379"),
+        list_ttl: Duration::from_secs(list_ttl),
         tracing,
     })
 }

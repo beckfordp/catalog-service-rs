@@ -1,75 +1,68 @@
 // SPDX-License-Identifier: MIT
 
-//! Reads cached in Redis in front of the store (cache-aside, gluon-rs
-//! `redis-cache`): a found example is cached for [`TTL`]; a write deletes its
-//! key. Redis is never the source of truth: down or slow, every read goes to
-//! the store, within the cache's timeout. Replaced by the Scala service's
-//! cache (its keys and TTLs).
+//! The list cache, as the Scala `CatalogListCache`: each page at
+//! `catalog-list:<limit>:<offset>` as `{"catalogs":[…],"total":N}`, for the
+//! list TTL (60 s), with no invalidation on write (TTL-only freshness, US-1.2).
+//! Either implementation reads the other's entries. Redis is never the
+//! source of truth: down, slow, or holding what doesn't parse, it is a miss.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use redis_cache::Cache;
+use serde::{Deserialize, Serialize};
 
-use crate::domain::{Example, ExampleId};
-use crate::store::{Examples, StoreError};
+use crate::domain::Page;
+use crate::routes::CatalogResponse;
 
-/// How long a cached example stands.
-pub const TTL: Duration = Duration::from_secs(300);
-
-/// How long a cache call may take before the store answers instead.
+/// How long a cache call may take before Postgres answers instead.
 pub const TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The key an example is cached at.
+/// The key a page is cached at.
 #[must_use]
-pub fn key(id: ExampleId) -> String {
-    format!("catalog:example:{id}")
+pub fn key(page: Page) -> String {
+    format!("catalog-list:{}:{}", page.limit, page.offset)
 }
 
-/// `store`, its reads cached in `cache`.
+/// A cached page (the Scala `CatalogListCacheEntry`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    /// The page's entries, as answered.
+    pub catalogs: Vec<CatalogResponse>,
+    /// The true total.
+    pub total: i64,
+}
+
+/// The pages in Redis.
 #[derive(Debug, Clone)]
-pub struct CachedExamples<S> {
-    store: S,
-    cache: Arc<Cache>,
+pub struct ListCache {
+    redis: Arc<Cache>,
+    ttl: Duration,
 }
 
-impl<S> CachedExamples<S> {
-    /// `store`, cached in `cache`.
-    pub fn new(store: S, cache: Arc<Cache>) -> Self {
-        Self { store, cache }
-    }
-}
-
-/// Why a load didn't give an example to cache.
-enum Miss {
-    Absent,
-    Store(StoreError),
-}
-
-impl<S: Examples> Examples for CachedExamples<S> {
-    async fn get(&self, id: ExampleId) -> Result<Option<Example>, StoreError> {
-        let load = || async {
-            match self.store.get(id).await {
-                Ok(Some(example)) => Ok(example),
-                Ok(None) => Err(Miss::Absent),
-                Err(error) => Err(Miss::Store(error)),
-            }
-        };
-        match self.cache.get_or_load(&key(id), TTL, load).await {
-            Ok(example) => Ok(Some(example)),
-            Err(Miss::Absent) => Ok(None),
-            Err(Miss::Store(error)) => Err(error),
-        }
+impl ListCache {
+    /// Over `redis`, each page standing for `ttl`.
+    #[must_use]
+    pub fn new(redis: Arc<Cache>, ttl: Duration) -> Self {
+        Self { redis, ttl }
     }
 
-    async fn insert(&self, example: &Example) -> Result<(), StoreError> {
-        self.store.insert(example).await?;
-        // A stale entry expires within the TTL if Redis is down now.
-        let _ = self.cache.delete(&[&key(example.id)]).await;
-        Ok(())
+    /// The cached page, or `None` on a miss — including Redis down or an
+    /// entry that doesn't parse.
+    pub async fn get(&self, page: Page) -> Option<Entry> {
+        let cached = self.redis.get(&key(page)).await.ok()??;
+        serde_json::from_str(&cached).ok()
     }
 
-    async fn ping(&self, within: Duration) -> bool {
-        self.store.ping(within).await
+    /// Caches `entry` for `page`.
+    ///
+    /// # Errors
+    /// The cache's (the caller logs it; the answer is unaffected).
+    pub async fn set(&self, page: Page, entry: &Entry) -> Result<(), String> {
+        let json = serde_json::to_string(entry).map_err(|error| error.to_string())?;
+        self.redis
+            .set(&key(page), &json, self.ttl)
+            .await
+            .map_err(|error| error.to_string())
     }
 }

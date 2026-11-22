@@ -3,9 +3,10 @@
 //! The `catalog-service` binary: reads the config contract, migrates the
 //! database, then serves the HTTP API until SIGTERM or SIGINT.
 
-use catalog_service::cache::{self, CachedExamples};
+use catalog_service::cache::{self, ListCache};
 use catalog_service::config::{self, Config};
-use catalog_service::store::PgExamples;
+use catalog_service::server::AppState;
+use catalog_service::store::PgCatalogs;
 use catalog_service::{db, server};
 use redis_cache::Cache;
 use service_basics::{environment, runtime, shutdown};
@@ -78,10 +79,14 @@ async fn serve(config: &Config, tracer: SdkTracer) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let store = CachedExamples::new(PgExamples::new(pool), cache);
-    // No spans of its own yet: the first traced route or client uses it.
-    drop(tracer);
-    match server::run(config.port, store, shutdown::signal(SERVICE)).await {
+    let state = AppState {
+        store: PgCatalogs::new(pool),
+        cache: ListCache::new(cache, config.list_ttl),
+        logger: logger.clone(),
+    };
+    // No spans of its own: kept alive for the provider's lifetime.
+    let _tracer = tracer;
+    match server::run(config.port, state, shutdown::signal(SERVICE)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             logger.error(&[("error", &error.to_string())], "HTTP server failed");
