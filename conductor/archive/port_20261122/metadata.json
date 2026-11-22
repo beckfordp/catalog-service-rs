@@ -1,7 +1,7 @@
 {
   "track_id": "port_20261122",
   "type": "feature",
-  "status": "in_progress",
+  "status": "archived",
   "created_at": "2026-11-22T22:05:00Z",
   "updated_at": "2026-11-22T22:05:00Z",
   "description": "Port Scala catalog-service: catalogue in Postgres, the list cached in Redis, six routes, docs (gluon all-Rust Stage A GREEN)."
