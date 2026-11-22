@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+# Copy to gluon environments/local/catalog-service-rs.values.yaml: the Rust
+# catalog-service, installed by bin/k8s-local-up under the same release name
+# when its <SVC>_IMPL=rust. The same env vars as catalog-service.values.yaml (copy
+# them from there); the chart's JVM-only settings blanked.
+image:
+  repository: catalog-service-rs
+  tag: latest
+
+javaOpts: ""
+mallocArenaMax: ""
+
+env:
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://tempo:4318
+  - name: POSTGRES_HOST
+    value: catalog-postgres
+  - name: POSTGRES_DB
+    value: catalog
+  - name: POSTGRES_USER
+    value: catalog
+  - name: POSTGRES_PASSWORD
+    value: catalog
